@@ -122,6 +122,13 @@ extern uint32_t ieee80211_bar_rx_count;
 static uint32_t mwx_rx_hwdec_cnt, mwx_rx_swdec_cnt;
 static uint32_t mwx_rx_ctl_cnt, mwx_rx_bar_cnt;	/* control frames reaching the driver */
 
+/*
+ * TX path sanity counters, reported by MtkMwx::debugPoll().  Unicast data
+ * must never take the fixed-rate path, and BA_DISABLE should disappear once
+ * ADDBA for the TID completes.
+ */
+static uint32_t mwx_tx_data_cnt, mwx_tx_data_fixed_cnt, mwx_tx_data_noba_cnt;
+
 /* RX drop reason counters, reported by MtkMwx::debugPoll(). */
 #define MWX_RX_DROP_REASONS	12
 static const char *mwx_rx_drop_name[MWX_RX_DROP_REASONS];
@@ -6334,7 +6341,7 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 	uint32_t val;
 	uint8_t type, subtype, tid = 0;
 	u_int hdrlen;
-	int multicast;
+	int multicast, is_data;
 
 
 	wh = mtod(m, struct ieee80211_frame *);
@@ -6343,8 +6350,16 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 	subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
 	subtype >>= IEEE80211_FC0_SUBTYPE_SHIFT;
 	multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+	/*
+	 * type was shifted down to the 2-bit type value, so compare it against
+	 * the shifted constant.  Comparing it against the unshifted
+	 * IEEE80211_FC0_TYPE_DATA (0x08) is always false and made every data
+	 * frame look like a management frame: the firmware then used the
+	 * lowest legacy rate, forced 20 MHz and disabled TX aggregation.
+	 */
+	is_data = (type == (IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT));
 
-	if (type == IEEE80211_FC0_TYPE_CTL)
+	if (type == (IEEE80211_FC0_TYPE_CTL >> IEEE80211_FC0_TYPE_SHIFT))
 		hdrlen = sizeof(struct ieee80211_frame_min);
 	else
 		hdrlen = ieee80211_get_hdrlen(wh);
@@ -6360,8 +6375,7 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 	 * Like Linux: aggregate only TIDs with a TX Block Ack agreement, and
 	 * let the MAC build A-MSDUs where the AP allowed A-MSDU in A-MPDU.
 	 */
-	if (type == (IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT) &&
-	    !multicast) {
+	if (is_data && !multicast) {
 		struct ieee80211_tx_ba *ba = ieee80211_has_qos(wh) && tid < 8 ?
 		    &ni->ni_tx_ba[tid] : NULL;
 
@@ -6418,8 +6432,8 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 	}
 #endif
 
-	if (multicast || type != IEEE80211_FC0_TYPE_DATA) {
-		/* Fixed rata is available just for 802.11 txd */
+	if (!is_data || multicast) {
+		/* Fixed rate is available just for 802.11 txd */
 		uint32_t rate, val6;
 
 		val |= MT_TXD2_FIX_RATE;
@@ -6461,6 +6475,14 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 
 	val = MT_TXD7_TYPE(type) | MT_TXD7_SUB_TYPE(subtype);
 	txp->txwi[7] |= htole32(val);
+
+	if (is_data && !multicast) {
+		mwx_tx_data_cnt++;
+		if (txp->txwi[2] & htole32(MT_TXD2_FIX_RATE))
+			mwx_tx_data_fixed_cnt++;
+		if (txp->txwi[3] & htole32(MT_TXD3_BA_DISABLE))
+			mwx_tx_data_noba_cnt++;
+	}
 
 #if NBPFILTER > 0
 	if (__predict_false(sc->sc_drvbpf != NULL)) {
@@ -7948,10 +7970,11 @@ MtkMwx::debugPoll()
 		    mwx_rx_bar_cnt);
 	if (verbose)
 		MWX_DEV_LOG(sc,
-		    "tx txwi_free=%u ring_free=%d full=%u oactive=%d tx_ba=%u amsdu=%d\n",
+		    "tx txwi_free=%u ring_free=%d full=%u oactive=%d tx_ba=%u amsdu=%d data=%u fixed_data=%u noba_data=%u\n",
 		    sc->sc_txwi.mt_nfree, mwx_dma_free_slots(&sc->sc_txq),
 		    sc->sc_tx_full_cnt, ifq_is_oactive(&ic->ic_if.if_snd) ? 1 : 0,
-		    ic->ic_stats.is_ht_tx_ba_agreements, sc->sc_tx_amsdu);
+		    ic->ic_stats.is_ht_tx_ba_agreements, sc->sc_tx_amsdu,
+		    mwx_tx_data_cnt, mwx_tx_data_fixed_cnt, mwx_tx_data_noba_cnt);
 	if (verbose && mwx_rxr_total != 0) {
 		MWX_DEV_LOG(sc,
 		    "rxrate n=%u mode[cck=%u ofdm=%u ht=%u vht=%u he=%u] bw[20=%u 40=%u 80=%u 160=%u] nss[1=%u 2=%u] "
