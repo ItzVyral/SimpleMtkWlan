@@ -23,10 +23,20 @@ void m_freem(mbuf*m){free(m->raw);delete m;}
 #define MT_TX_FREE_PAIR (1u<<31)
 #define MT_TX_FREE0_MSDU_CNT_GET(x) (((x)>>16)&0x3ff)
 #define MT_TX_FREE_MSDU_ID_GET(x) (((x)>>16)&0x7fff)
+#define MT_TX_FREE_STATUS_MASK (0x00006000u)
+#define MT_TX_FREE_COUNT_MASK (0x00001fffu)
 void mwx_tx_kick(mwx_softc*){}
 unsigned releases;
 void mwx_txwi_put(mwx_softc*,mwx_txwi*mt){assert(mt->mt_busy);mt->mt_busy=0;releases++;}
 mbuf* packet(size_t len){auto m=new mbuf{(unsigned char*)calloc(1,len),len,0};return m;}
+static unsigned mwx_txf_events,mwx_txf_freed,mwx_txf_pairs,mwx_txf_retries,mwx_txf_failed;
+static unsigned mwx_txf_batch[8];
+static void mwx_txf_batch_count(unsigned n){
+ int b;
+ if(n<=1)b=0;else if(n==2)b=1;else if(n<=4)b=2;else if(n<=8)b=3;
+ else if(n<=16)b=4;else if(n<=32)b=5;else if(n<=64)b=6;else b=7;
+ mwx_txf_batch[b]++;
+}
 '''
 main=r'''
 int main(int argc,char**argv){

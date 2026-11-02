@@ -129,6 +129,44 @@ static uint32_t mwx_rx_ctl_cnt, mwx_rx_bar_cnt;	/* control frames reaching the d
  */
 static uint32_t mwx_tx_data_cnt, mwx_tx_data_fixed_cnt, mwx_tx_data_noba_cnt;
 
+/*
+ * Datapath counters reported by MtkMwx::debugPoll().  The TX-free histogram
+ * is the cheapest way to see whether the MAC really aggregates: every entry
+ * is one A-MPDU (or a small batch) and only MPDU tokens are counted.
+ */
+static uint32_t mwx_txf_events, mwx_txf_freed, mwx_txf_pairs;
+static uint32_t mwx_txf_retries, mwx_txf_failed;
+static uint32_t mwx_txf_batch[8];	/* 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, >64 */
+static uint32_t mwx_tx_lin, mwx_tx_defrag, mwx_tx_bounce;
+static uint32_t mwx_txq_minfree = 0xffffffff;
+static uint32_t mwx_rx_ampdu, mwx_rx_nonampdu, mwx_rx_amsdu;
+static uint32_t mwx_rxq_minfree = 0xffffffff, mwx_rxq_fill_fail;
+static uint32_t mwx_rx_done_batches, mwx_rx_done_pkts, mwx_rx_done_max;
+
+static void
+mwx_txf_batch_count(uint32_t n)
+{
+	int b;
+
+	if (n <= 1)
+		b = 0;
+	else if (n == 2)
+		b = 1;
+	else if (n <= 4)
+		b = 2;
+	else if (n <= 8)
+		b = 3;
+	else if (n <= 16)
+		b = 4;
+	else if (n <= 32)
+		b = 5;
+	else if (n <= 64)
+		b = 6;
+	else
+		b = 7;
+	mwx_txf_batch[b]++;
+}
+
 /* RX drop reason counters, reported by MtkMwx::debugPoll(). */
 #define MWX_RX_DROP_REASONS	12
 static const char *mwx_rx_drop_name[MWX_RX_DROP_REASONS];
@@ -1862,6 +1900,7 @@ mwx_tx_linearize(struct mbuf *m)
 		m_freem(n);
 		return m;
 	}
+	mwx_tx_lin++;
 	m_freem(m);
 	return n;
 }
@@ -2758,13 +2797,17 @@ mwx_txwi_enqueue(struct mwx_softc *sc, struct mwx_txwi *mt, struct mbuf *m)
 
 	rv = bus_dmamap_load_mbuf(sc->sc_dmat, mt->mt_map, m,
 	    BUS_DMA_WRITE | BUS_DMA_NOWAIT);
-	if (rv == EFBIG && m_defrag(m, M_DONTWAIT) == 0)
+	if (rv == EFBIG && m_defrag(m, M_DONTWAIT) == 0) {
+		mwx_tx_defrag++;
 		rv = bus_dmamap_load_mbuf(sc->sc_dmat, mt->mt_map, m,
 		    BUS_DMA_WRITE | BUS_DMA_NOWAIT);
+	}
 	if (rv != 0)
 		return rv;
 
 	nsegs = mt->mt_map->dm_nsegs;
+	if (mt->mt_map->dm_bounce)
+		mwx_tx_bounce++;
 
 	{
 		static uint32_t seg_log_count;
@@ -3289,6 +3332,13 @@ mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
 
 	mwx_write(sc, q->mq_regbase + MT_DMA_CPU_IDX, q->mq_prod);
 
+	if (q == &sc->sc_txq) {
+		uint32_t free = mwx_dma_free_slots(q);
+
+		if (free < mwx_txq_minfree)
+			mwx_txq_minfree = free;
+	}
+
 	return 0;
 }
 
@@ -3538,6 +3588,12 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 	    BUS_DMASYNC_POSTREAD);
 
 	q->mq_cons = idx;
+	if (q == &sc->sc_rxq) {
+		uint32_t free = mwx_dma_free_slots(q);
+
+		if (free < mwx_rxq_minfree)
+			mwx_rxq_minfree = free;
+	}
 }
 
 void
@@ -3550,7 +3606,15 @@ mwx_dma_rx_done(struct mwx_softc *sc, struct mwx_queue *q)
 	if (ml_empty(&ml))
 		return;
 
-	mwx_queue_fill(sc, q);	/* TODO what if it fails, run timer? */
+	if (mwx_queue_fill(sc, q) != 0)
+		mwx_rxq_fill_fail++;	/* TODO run timer if it keeps failing */
+
+	if (q == &sc->sc_rxq) {
+		mwx_rx_done_batches++;
+		mwx_rx_done_pkts += ml.ml_len;
+		if (ml.ml_len > mwx_rx_done_max)
+			mwx_rx_done_max = ml.ml_len;
+	}
 
 	mwx_dma_rx_process(sc, &ml);
 }
@@ -6007,6 +6071,14 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		return -EINVAL;
 	}
 
+	/* How much of the AP's traffic the MAC really delivers aggregated. */
+	if (rxd2 & MT_RXD2_NORMAL_NON_AMPDU)
+		mwx_rx_nonampdu++;
+	else
+		mwx_rx_ampdu++;
+	if (rxd4 & MT_RXD4_NORMAL_PAYLOAD_FORMAT)
+		mwx_rx_amsdu++;
+
 	rxd += 6;
 
 	if (rxd1 & MT_RXD1_NORMAL_GROUP_4) {
@@ -6640,17 +6712,39 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 		goto out;
 
 	txfree = mtod(m, uint32_t *);
+	{
+	uint32_t freed = 0;
+	bool have_wcid = false;
+
 	for (i = 0; i < count; i++) {
 		uint16_t msdu;
+		uint32_t retries, status;
 
 		/* PAIR words extend count, but never the received payload. */
 		if ((size_t)i >= mbuf_len(m) / sizeof(*txfree))
 			break;
 		txval = le32toh(txfree[i]);
 		if (txval & MT_TX_FREE_PAIR) {
+			mwx_txf_pairs++;
+			have_wcid = true;
 			count++;
 			continue;
 		}
+
+		/*
+		 * Firmware reports how many times it retried this MPDU and
+		 * whether it eventually gave up. This is the real TX result,
+		 * not the net80211 link rate. As in Linux, only count it for
+		 * an MSDU that follows its station's PAIR word.
+		 */
+		if (have_wcid) {
+			retries = txval & MT_TX_FREE_COUNT_MASK;
+			status = txval & MT_TX_FREE_STATUS_MASK;
+			mwx_txf_retries += retries ? retries - 1 : 0;
+			if (status)
+				mwx_txf_failed++;
+		}
+		freed++;
 
 		msdu = MT_TX_FREE_MSDU_ID_GET(txval);
 		if (msdu >= sc->sc_txwi.mt_count)
@@ -6659,6 +6753,12 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 		if (mt->mt_busy == 0)
 			continue;
 		mwx_txwi_put(sc, mt);
+	}
+
+	mwx_txf_events++;
+	mwx_txf_freed += freed;
+	if (freed != 0)
+		mwx_txf_batch_count(freed);
 	}
 
 out:
@@ -7610,6 +7710,63 @@ int mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
 }
 
 /*
+ * Program the Block Ack state in the station's WTBL entry. Linux does this
+ * with a WTBL_SET request carrying a WTBL_BA nested TLV before it sends the
+ * STA_REC_BA record, and the firmware only aggregates/answers A-MPDUs once
+ * it has this. Without it the MAC keeps sending single MPDUs even though
+ * net80211 and the AP agreed on a Block Ack session.
+ */
+static int
+mwx_mcu_sta_wtbl_ba(struct mwx_softc *sc, struct ieee80211_node *ni,
+    uint8_t tid, uint16_t ssn, uint16_t winsize, int enable, int tx)
+{
+	struct mwx_node *mn = (struct mwx_node *)ni;
+	struct sta_rec_wtbl *wtbl;
+	struct wtbl_ba *ba;
+	struct mbuf *m;
+	uint16_t tlvnum = 0;
+
+	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	if (m == NULL)
+		return ENOBUFS;
+
+	wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum,
+	    STA_REC_WTBL, sizeof(*wtbl));
+	wtbl->wlan_idx_lo = mn->wcid & 0xff;
+	wtbl->wlan_idx_hi = mn->wcid >> 8;
+	wtbl->operation = WTBL_SET;
+
+	ba = (struct wtbl_ba *)mwx_append_len(m, sizeof(*ba));
+	memset(ba, 0, sizeof(*ba));
+	ba->tag = htole16(WTBL_BA);
+	ba->len = htole16(sizeof(*ba));
+	ba->tid = tid;
+	if (tx) {
+		ba->ba_type = MT_BA_TYPE_ORIGINATOR;
+		ba->sn = htole16(enable ? ssn : 0);
+		ba->ba_winsize = htole16(enable ? winsize : 0);
+		ba->ba_en = enable ? 1 : 0;
+	} else {
+		memcpy(ba->peer_addr, ni->ni_macaddr, IEEE80211_ADDR_LEN);
+		ba->ba_type = MT_BA_TYPE_RECIPIENT;
+		ba->rst_ba_tid = tid;
+		ba->rst_ba_sel = RST_BA_MAC_TID_MATCH;
+		ba->rst_ba_sb = 1;
+		/* connac2 also carries the window size for recipients */
+		ba->ba_winsize = htole16(enable ? winsize : 0);
+	}
+
+	wtbl->tlv_num = htole16(1);
+	wtbl->len = htole16(sizeof(*wtbl) + sizeof(*ba));
+
+	m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx,
+	    mn->wcid, tlvnum);
+	if (m == NULL)
+		return ENOBUFS;
+	return mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, NULL);
+}
+
+/*
  * RX Block Ack session (we are the recipient). The firmware must know about
  * it to answer the AP's A-MPDUs with BlockAck; net80211 reorders in software.
  * Called from RX processing, so do not wait for the MCU response here.
@@ -7622,6 +7779,14 @@ mwx_mcu_sta_ba(struct mwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
 	struct sta_rec_ba *ba;
 	struct mbuf *m;
 	uint16_t tlvnum = 0;
+	int rv;
+
+	rv = mwx_mcu_sta_wtbl_ba(sc, ni, tid, ssn, winsize, enable, tx);
+	if (rv != 0) {
+		MWX_DEV_LOG(sc, "wtbl BA %s tid=%u rv=%d\n",
+		    tx ? "tx" : "rx", tid, rv);
+		return rv;
+	}
 
 	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
 	if (m == NULL)
@@ -7851,12 +8016,13 @@ MtkMwx::debugPoll()
 {
 	struct mwx_softc *sc = com;
 	struct ieee80211com *ic;
-	static uint32_t polls, last_intr_calls;
+	static uint32_t polls, last_intr_calls, last_poll_print;
 	static uint32_t last_txq_dma = 0xffffffff, last_mcu_dma = 0xffffffff;
 	static uint32_t txq_stuck, mcu_stuck, last_reset_poll;
 	static int stall_dumped;
 	uint32_t sta, ena, lp, mcu;
 	uint32_t tq_cpu, tq_dma, mq_cpu, mq_dma;
+	uint32_t secs = 1, irqs = 0;
 	int verbose;
 
 	if (sc == NULL || !sc->sc_fw_loaded || sc->sc_resetting ||
@@ -7922,11 +8088,16 @@ MtkMwx::debugPoll()
 		size_t off = 0;
 		int i;
 
+		secs = polls - last_poll_print;
+		irqs = mwx_intr_calls - last_intr_calls;
+		if (secs == 0)
+			secs = 1;
+		last_poll_print = polls;
 		MWX_DEV_LOG(sc,
-		    "poll state=%d chan=%u intr_calls=%u sta=0x%08x ena=0x%08x lpctl=0x%08x mcu_cmd=0x%08x\n",
+		    "poll state=%d chan=%u intr_calls=%u irq/s=%u sta=0x%08x ena=0x%08x lpctl=0x%08x mcu_cmd=0x%08x\n",
 		    ic->ic_state,
 		    ic->ic_bss ? ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan) : 0,
-		    mwx_intr_calls, sta, ena, lp, mcu);
+		    mwx_intr_calls, irqs / secs, sta, ena, lp, mcu);
 		MWX_DEV_LOG(sc,
 		    "poll txq cpu=%u dma=%u | txmcu cpu=%u dma=%u | rxq cpu=%u dma=%u cons=%u | rxmcu cpu=%u dma=%u cons=%u\n",
 		    tq_cpu, tq_dma, mq_cpu, mq_dma,
@@ -7968,13 +8139,39 @@ MtkMwx::debugPoll()
 		    ieee80211_bar_rx_count,
 		    ic->ic_stats.is_ht_rx_ba_agreements, mwx_rx_ctl_cnt,
 		    mwx_rx_bar_cnt);
-	if (verbose)
+	if (verbose) {
 		MWX_DEV_LOG(sc,
-		    "tx txwi_free=%u ring_free=%d full=%u oactive=%d tx_ba=%u amsdu=%d data=%u fixed_data=%u noba_data=%u\n",
+		    "tx txwi_free=%u ring_free=%d ring_min=%u full=%u oactive=%d tx_ba=%u amsdu=%d data=%u fixed_data=%u noba_data=%u lin=%u defrag=%u bounce=%u\n",
 		    sc->sc_txwi.mt_nfree, mwx_dma_free_slots(&sc->sc_txq),
-		    sc->sc_tx_full_cnt, ifq_is_oactive(&ic->ic_if.if_snd) ? 1 : 0,
+		    mwx_txq_minfree, sc->sc_tx_full_cnt,
+		    ifq_is_oactive(&ic->ic_if.if_snd) ? 1 : 0,
 		    ic->ic_stats.is_ht_tx_ba_agreements, sc->sc_tx_amsdu,
-		    mwx_tx_data_cnt, mwx_tx_data_fixed_cnt, mwx_tx_data_noba_cnt);
+		    mwx_tx_data_cnt, mwx_tx_data_fixed_cnt, mwx_tx_data_noba_cnt,
+		    mwx_tx_lin, mwx_tx_defrag, mwx_tx_bounce);
+		MWX_DEV_LOG(sc,
+		    "aggr sec=%u irq/s=%u txf_ev=%u txf_mpdu=%u pair=%u retries=%u failed=%u "
+		    "batch[1=%u 2=%u 3-4=%u 5-8=%u 9-16=%u 17-32=%u 33-64=%u >64=%u] "
+		    "rx_ampdu=%u rx_single=%u rx_amsdu=%u rxq_min=%u rxq_fail=%u "
+		    "rxdone[batches=%u pkts=%u max=%u]\n",
+		    secs, irqs / secs, mwx_txf_events, mwx_txf_freed,
+		    mwx_txf_pairs, mwx_txf_retries, mwx_txf_failed,
+		    mwx_txf_batch[0], mwx_txf_batch[1], mwx_txf_batch[2],
+		    mwx_txf_batch[3], mwx_txf_batch[4], mwx_txf_batch[5],
+		    mwx_txf_batch[6], mwx_txf_batch[7],
+		    mwx_rx_ampdu, mwx_rx_nonampdu, mwx_rx_amsdu,
+		    mwx_rxq_minfree, mwx_rxq_fill_fail, mwx_rx_done_batches,
+		    mwx_rx_done_pkts, mwx_rx_done_max);
+		/* interval counters */
+		mwx_txf_events = mwx_txf_freed = mwx_txf_pairs = 0;
+		mwx_txf_retries = mwx_txf_failed = 0;
+		memset(mwx_txf_batch, 0, sizeof(mwx_txf_batch));
+		mwx_tx_lin = mwx_tx_defrag = mwx_tx_bounce = 0;
+		mwx_txq_minfree = 0xffffffff;
+		mwx_rx_ampdu = mwx_rx_nonampdu = mwx_rx_amsdu = 0;
+		mwx_rxq_minfree = 0xffffffff;
+		mwx_rxq_fill_fail = 0;
+		mwx_rx_done_batches = mwx_rx_done_pkts = mwx_rx_done_max = 0;
+	}
 	if (verbose && mwx_rxr_total != 0) {
 		MWX_DEV_LOG(sc,
 		    "rxrate n=%u mode[cck=%u ofdm=%u ht=%u vht=%u he=%u] bw[20=%u 40=%u 80=%u 160=%u] nss[1=%u 2=%u] "
@@ -7996,7 +8193,8 @@ MtkMwx::debugPoll()
 		memset(mwx_rxr_mcs, 0, sizeof(mwx_rxr_mcs));
 		mwx_rxr_sgi = mwx_rxr_stbc = mwx_rxr_ldpc = mwx_rxr_total = 0;
 	}
-	last_intr_calls = mwx_intr_calls;
+	if (verbose)
+		last_intr_calls = mwx_intr_calls;
 
 	if (txq_stuck == 2 && !stall_dumped && tq_dma < sc->sc_txq.mq_count) {
 		struct mwx_desc *d = &sc->sc_txq.mq_desc[tq_dma];

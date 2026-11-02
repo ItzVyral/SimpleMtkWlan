@@ -1488,6 +1488,34 @@ struct wtbl_hdr_trans {
 	uint8_t		rsv;
 } __packed;
 
+#define	WTBL_BA				0x08
+struct wtbl_ba {
+	uint16_t	tag;
+	uint16_t	len;
+	/* common */
+	uint8_t		tid;
+	uint8_t		ba_type;
+	uint8_t		rsv0[2];
+	/* originator only */
+	uint16_t	sn;
+	uint8_t		ba_en;
+	uint8_t		ba_winsize_idx;
+	/* originator & recipient */
+	uint16_t	ba_winsize;
+	/* recipient only */
+	uint8_t		peer_addr[IEEE80211_ADDR_LEN];
+	uint8_t		rst_ba_tid;
+	uint8_t		rst_ba_sel;
+	uint8_t		rst_ba_sb;
+	uint8_t		band_idx;
+	uint8_t		rsv1[4];
+} __packed;
+
+/* rst_ba_sel: recipient BA session reset matching */
+#define	RST_BA_MAC_TID_MATCH		0
+#define	RST_BA_MAC_MATCH		1
+#define	RST_BA_NO_MATCH			2
+
 #define	WTBL_SMPS			0x0d
 struct wtbl_smps {
 	uint16_t	tag;
